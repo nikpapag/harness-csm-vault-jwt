@@ -1,0 +1,294 @@
+template:
+  name: Vault Secret Engines
+  identifier: Vault_Secret_Engines
+  versionLabel: v1
+  type: SecretManager
+  projectIdentifier: << REPLACE ME >> 
+  orgIdentifier: default
+  tags: {}
+  spec:
+    shell: Bash
+    source:
+      type: Inline
+      spec:
+        script: |+
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Hardcoded Harness API key
+          HARNESS_API_KEY=<+secrets.getValue(<<REPLACE ME>>)>
+          HARNESS_ACCOUNT_ID=<<REPLACE ME>>
+          AUDIENCE="harness/jwt"
+
+          export VAULT_ADDR=<+secretManager.environmentVariables.vault_addr>
+          export VAULT_NAMESPACE=<+secretManager.environmentVariables.vault_namespace>
+          ENVIRONMENT_ID=<+secretManager.environmentVariables.env_id>
+          SERVICE_ID=<+secretManager.environmentVariables.service_id>
+
+
+
+          # Path type: "kv" or "db-readonly" or "db-readwrite"
+          PATH_TYPE=<+secretManager.environmentVariables.path_type>
+
+          # For KV paths, specify the subpath after service_id (optional)
+          KV_SUBPATH=""  # e.g., "api_key" or leave empty for root
+          # For KV paths, specify which key to extract (optional)
+          KEY_NAME=<+secretManager.environmentVariables.key_name>
+
+          # Construct VAULT_PATH based on pattern
+          case "$PATH_TYPE" in
+            kv)
+              if [ -n "$KV_SUBPATH" ]; then
+                VAULT_PATH="harness/kv/data/$ENVIRONMENT_ID/$SERVICE_ID/$KV_SUBPATH"
+              else
+                VAULT_PATH="harness/kv/data/$ENVIRONMENT_ID/$SERVICE_ID"
+              fi
+              ;;
+            db-readonly)
+              VAULT_PATH="database/creds/harness-readonly-$ENVIRONMENT_ID"
+              ;;
+            db-readwrite)
+              VAULT_PATH="database/creds/harness-readwrite-$ENVIRONMENT_ID"
+              ;;
+            *)
+              echo "❌ Invalid PATH_TYPE: $PATH_TYPE. Must be 'kv', 'db-readonly', or 'db-readwrite'" >&2
+              exit 1
+              ;;
+          esac
+
+
+          # Fixed configuration - always JSON format and quiet mode
+          OUTPUT_FORMAT="json"
+          QUIET=true
+
+
+
+          log(){
+              if [ "$QUIET" == false ]; then
+                echo "$@" >&2
+              fi
+          }
+
+
+          log "Validating claims and accessing Vault..."
+          log "  Environment: $ENVIRONMENT_ID"
+          log "  Service: $SERVICE_ID"
+          log "  Path: $VAULT_PATH"
+          log ""
+
+          # Step 1: Get JWT token from Harness with custom claims
+          log "Step 1: Acquiring JWT token with claims..."
+          RESPONSE=$(curl -s -X POST \
+            "https://app.harness.io/ng/api/oidc/id-token/custom?accountIdentifier=$HARNESS_ACCOUNT_ID" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $HARNESS_API_KEY" \
+            -d "{
+              \"accountId\": \"$HARNESS_ACCOUNT_ID\",
+              \"oidcIdTokenCustomAttributesStructure\": {
+                \"account_id\": \"$HARNESS_ACCOUNT_ID\",
+                \"environment_id\": \"$ENVIRONMENT_ID\",
+                \"service_id\": \"$SERVICE_ID\"
+              },
+              \"sub\": \"pipeline-execution\",
+              \"aud\": \"$AUDIENCE\"
+            }")
+
+          #Extract JWT token
+          if echo "$RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
+            DATA_TYPE=$(echo "$RESPONSE" | jq -r '.data | type')
+            if [ "$DATA_TYPE" == "string" ]; then
+              JWT_TOKEN=$(echo "$RESPONSE" | jq -r '.data')
+            else
+              JWT_TOKEN=$(echo "$RESPONSE" | jq -r '.data.token')
+            fi
+            log "✅ JWT token acquired"
+          else
+            log "❌ Failed to get JWT token from Harness"
+            echo "$RESPONSE" | jq . >&2
+            exit 1
+          fi
+
+          # Decode and show token claims (if not quiet)
+          if [ "$QUIET" = false ]; then
+            log ""
+            log "JWT Token Claims:"
+            # Extract payload and add padding if needed
+            PAYLOAD_B64=$(echo "$JWT_TOKEN" | cut -d'.' -f2)
+            # Add padding: JWT base64 doesn't include padding, so add it
+            case $((${#PAYLOAD_B64} % 4)) in
+              2) PAYLOAD_B64="${PAYLOAD_B64}==" ;;
+              3) PAYLOAD_B64="${PAYLOAD_B64}=" ;;
+            esac
+            PAYLOAD=$(echo "$PAYLOAD_B64" | base64 -D 2>/dev/null || echo "{}")
+            if echo "$PAYLOAD" | jq -e '.environment_id' > /dev/null 2>&1; then
+              echo "$PAYLOAD" | jq '{environment_id, service_id, account_id}' >&2
+            else
+              log "  (Could not decode payload)"
+            fi
+            log ""
+          fi
+
+          # Step 2: Authenticate with Vault using the templated role
+          log "Step 2: Authenticating with Vault (role: harness-pipeline)..."
+          VAULT_LOGIN_RESPONSE=$(vault write -format=json auth/harness/jwt/login \
+            role=harness-pipeline \
+            jwt="$JWT_TOKEN" 2>&1)
+
+          if ! echo "$VAULT_LOGIN_RESPONSE" | jq -e '.auth.client_token' > /dev/null 2>&1; then
+            log "❌ Vault authentication failed"
+            echo "$VAULT_LOGIN_RESPONSE" >&2
+            exit 1
+          fi
+
+          CLIENT_TOKEN=$(echo "$VAULT_LOGIN_RESPONSE" | jq -r '.auth.client_token')
+          log "✅ Vault authentication successful"
+
+          # Show what metadata was mapped (if not quiet)
+          if [ "$QUIET" = false ]; then
+            log ""
+            log "Token Metadata (from claim mappings):"
+            echo "$VAULT_LOGIN_RESPONSE" | jq '.auth.metadata' >&2
+            log ""
+          fi
+
+          export VAULT_TOKEN="$CLIENT_TOKEN"
+
+          # Step 3: Validate path matches claims (optional check)
+          log "Step 3: Validating path matches claims..."
+          if [[ "$VAULT_PATH" == *"/$ENVIRONMENT_ID/"* ]] || [[ "$VAULT_PATH" == *"-$ENVIRONMENT_ID"* ]] || [[ "$VAULT_PATH" == *"-$ENVIRONMENT_ID/"* ]]; then
+            log "✅ Path contains environment_id: $ENVIRONMENT_ID"
+          else
+            log "⚠️  Warning: Path does not contain environment_id '$ENVIRONMENT_ID'"
+            log "   This may still work if the path is valid for this token"
+          fi
+          log ""
+
+          # Step 4: Read from the provided path
+          log "Step 4: Reading from path: $VAULT_PATH..."
+          set +e  # Temporarily disable exit on error
+          READ_RESULT=$(vault read -format=json "$VAULT_PATH" 2>&1)
+          READ_EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+
+          if [ $READ_EXIT_CODE -ne 0 ]; then
+            log "❌ Vault read failed (exit code: $READ_EXIT_CODE)"
+            log "Error output:"
+            echo "$READ_RESULT" >&2
+            exit 1
+          fi
+
+          if echo "$READ_RESULT" | jq -e '.data' > /dev/null 2>&1; then
+            log "✅ Successfully read from path"
+            log ""
+
+            # Check if this is a dynamic secret (database creds) or KV secret
+            IS_DYNAMIC_SECRET=false
+            if echo "$READ_RESULT" | jq -e '.data.username' > /dev/null 2>&1; then
+              IS_DYNAMIC_SECRET=true
+            fi
+
+            # Extract the data
+            if [ -n "${KEY_NAME:-}" ] && [ "${KEY_NAME}" != "" ]; then
+              # Extract specific key
+              log "Step 5: Extracting key: $KEY_NAME"
+              if [ "$IS_DYNAMIC_SECRET" = true ]; then
+                # For dynamic secrets, keys are at .data.<key>
+                EXTRACTED=$(echo "$READ_RESULT" | jq -r ".data.${KEY_NAME} // empty")
+              else
+                # For KV secrets, keys are at .data.data.<key>
+                EXTRACTED=$(echo "$READ_RESULT" | jq -r ".data.data.${KEY_NAME} // .data.${KEY_NAME} // empty")
+              fi
+
+              if [ -z "$EXTRACTED" ] || [ "$EXTRACTED" = "null" ]; then
+                log "❌ Key '$KEY_NAME' not found in secret"
+                exit 1
+              fi
+
+              # Set secret variable for Harness CSM
+              secret="$EXTRACTED"
+              echo "$EXTRACTED"
+            elif [ -n "${OUTPUT_FORMAT:-}" ]; then
+              # Format output for easy consumption
+              log "Step 5: Formatting output as: $OUTPUT_FORMAT"
+
+              case "$OUTPUT_FORMAT" in
+                json)
+                  # Return JSON - handle both dynamic and KV secrets
+                  if [ "$IS_DYNAMIC_SECRET" = true ]; then
+                    secret=$(echo "$READ_RESULT" | jq -c '.data')
+                    echo "$secret"
+                  else
+                    secret=$(echo "$READ_RESULT" | jq -c '.data')
+                    echo "$secret"
+                  fi
+                  ;;
+                env)
+                  # Return as space-separated env vars (for export)
+                  # Works for database creds: DB_USERNAME=user DB_PASSWORD=pass
+                  if echo "$READ_RESULT" | jq -e '.data.username' > /dev/null 2>&1; then
+                    # Database credentials
+                    USERNAME=$(echo "$READ_RESULT" | jq -r '.data.username')
+                    PASSWORD=$(echo "$READ_RESULT" | jq -r '.data.password')
+                    secret="DB_USERNAME=\"$USERNAME\" DB_PASSWORD=\"$PASSWORD\""
+                    echo "$secret"
+                  else
+                    # KV secret - output all keys as KEY=value
+                    secret=$(echo "$READ_RESULT" | jq -r '.data.data // .data | to_entries | map("\(.key | ascii_upcase)=\"\(.value)\"") | join(" ")')
+                    echo "$secret"
+                  fi
+                  ;;
+                shell)
+                  # Return as export statements (for eval)
+                  if echo "$READ_RESULT" | jq -e '.data.username' > /dev/null 2>&1; then
+                    # Database credentials
+                    USERNAME=$(echo "$READ_RESULT" | jq -r '.data.username')
+                    PASSWORD=$(echo "$READ_RESULT" | jq -r '.data.password')
+                    secret="export DB_USERNAME=\"$USERNAME\"
+          export DB_PASSWORD=\"$PASSWORD\""
+                    echo "$secret"
+                  else
+                    # KV secret - export all keys
+                    secret=$(echo "$READ_RESULT" | jq -r '.data.data // .data | to_entries | map("export \(.key | ascii_upcase)=\"\(.value)\"") | .[]')
+                    echo "$secret"
+                  fi
+                  ;;
+                *)
+                  log "❌ Unknown format: $OUTPUT_FORMAT"
+                  log "   Valid formats: json, env, shell"
+                  exit 1
+                  ;;
+              esac
+            else
+              # Return full data
+              secret=$(echo "$READ_RESULT" | jq -c '.data')
+              echo "$secret"
+            fi
+          else
+            log "❌ Failed to read from path: $VAULT_PATH"
+            echo "$READ_RESULT" >&2
+            exit 1
+          fi
+
+
+    delegateSelectors: []
+    environmentVariables:
+      - name: vault_addr
+        type: String
+        value: https://vault-cluster-public-vault.hashicorp.cloud:8200 <<--- REPLACE ME
+      - name: vault_namespace
+        type: String
+        value: admin
+      - name: env_id
+        type: String
+        value: <+input>
+      - name: service_id
+        type: String
+        value: <+input>
+      - name: key_name
+        type: String
+        value: <+input>
+      - name: path_type
+        type: String
+        value: <+input>.selectOneFrom(kv,db-readonly)
+    outputVariables: []
+    onDelegate: true
